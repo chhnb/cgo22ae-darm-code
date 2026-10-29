@@ -1,0 +1,28 @@
+作者版本与当前工作版本的差异分类
+
+基线：作者提交 e9bc0540325ad9806313d34e84fc901496fd8be6。
+完整差异使用 git diff e9bc0540325ad9806313d34e84fc901496fd8be6 -- llvm/lib/Transforms/CFMelder 查看。
+此审查用于避免把本地工作版本标为未经修改的作者原版。
+
+一、正确性/合法性相关修改（BF与DARM适用时共享）
+InstructionMatch：switch比较case常量而不是迭代器代理地址。
+RegionAnalyzer：region对应关系要求双射；共享后继一致；只访问受当前分支支配的块；
+非dominance-chain结构保守拒绝，不以空列表代替合法BB配对。
+RegionMelder：不支持的控制流、blockaddress和convergent操作保守拒绝；
+终结指令/块标记约束；switch只选择条件、不选择目标标签；
+CFG/PHI入边数量及重复switch边修复；失败返回明确状态。
+SeqAlignmentUtils / SmithWaterman相关：保留未匹配尾部及结构边界。
+CFMelder：成功改写后重新发现候选，避免消费失效block；修正once模式的Changed记录。
+这些修复会影响合法候选集合与实际序列，不能承诺与原版算法输出完全相同。
+
+二、外部调度接口（不是作者原算法，默认关闭）
+-cfmelder-entry-only：仅尝试入口分歧，允许越过单前驱无条件入口链；
+ADJACENT_ENTRY_MELD_SUCCESS：供外部调度器识别真实成功。
+BF/DARM自动对照不传entry-only，不传run-once，不运行Python贪心。
+
+三、策略配置（调用层明确分开）
+BF/DaRM自动对照沿用阈值0.2；BF加run-branch-fusion-only。
+我们的配对生成器阈值0.0、entry-only/once：合法性生成不由外部评分阈值代替。
+贪心和暴力枚举共享这个配对生成器；候选选择不在LLVM补丁中实现。
+
+本次迁移没有新增算法修复或收益优化，也没有声称解决全部历史失败。

@@ -30,6 +30,8 @@ static cl::opt<bool>
                         cl::desc("Run branch fusion only, no region-melding"));
 
 bool RegionComparator::compare() {
+  Mapping.clear();
+  DenseMap<BasicBlock *, BasicBlock *> ReverseMapping;
   DenseMap<BasicBlock *, int> LabelMapR1;
   DenseMap<BasicBlock *, int> LabelMapR2;
   SmallVector<BasicBlock *, 0> StackR1;
@@ -39,8 +41,19 @@ bool RegionComparator::compare() {
   StackR2.push_back(R2->getEntry());
   // do a parallel DFS traversal
   while (!StackR1.empty()) {
+    if (StackR2.empty()) return false;
     BasicBlock *CurrBlockR1 = StackR1.pop_back_val();
     BasicBlock *CurrBlockR2 = StackR2.pop_back_val();
+    // Shared successors can be queued more than once before being visited.
+    // A consistent bijection is required, especially for switches whose
+    // case labels may alias the same destination.
+    auto Known = Mapping.find(CurrBlockR1);
+    if (Known != Mapping.end()) {
+      if (Known->second != CurrBlockR2) return false;
+      continue;
+    }
+    if (ReverseMapping.count(CurrBlockR2)) return false;
+    ReverseMapping[CurrBlockR2] = CurrBlockR1;
     // num of successors must match
     if (CurrBlockR1->getTerminator()->getNumSuccessors() !=
         CurrBlockR2->getTerminator()->getNumSuccessors())
@@ -243,7 +256,8 @@ void RegionAnalyzer::computeRegionMatch() {
   }
 
   // find the regions on left and right paths
-  findMergeableRegions(*DivergentBB);
+  if (!findMergeableRegions(*DivergentBB))
+    return;
 
   // Case 1 : No regions found. L and R paths have single BB
   if (LeftRegions.empty() && RightRegions.empty()) {
@@ -401,6 +415,11 @@ void RegionAnalyzer::findMergeableBBsInPath(
   while (!WorkList.empty()) {
     BasicBlock *Cand = WorkList.pop_back_val();
     Visited.push_back(Cand);
+    // A loop backedge can lead out of this branch arm and into shared or
+    // opposite-arm blocks before reaching To. Such blocks are not local
+    // candidates for replication/melding on this path.
+    if (!DT.dominates(From, Cand))
+      continue;
     // if region replication is not allowed, basic blocks that post dominates
     // From can be a meld candidate
     if (DisableRegionReplication) {
@@ -424,7 +443,7 @@ void RegionAnalyzer::findMergeableBBsInPath(
   //   errs() << "cand : " << BB->getName() << "\n";
 }
 
-void RegionAnalyzer::findMergeableRegions(BasicBlock &BB) {
+bool RegionAnalyzer::findMergeableRegions(BasicBlock &BB) {
   Region *R = RI->getRegionFor(&BB);
 
   assert(BB.getTerminator()->getNumSuccessors() == 2 &&
@@ -469,11 +488,15 @@ void RegionAnalyzer::findMergeableRegions(BasicBlock &BB) {
     }
   }
 
-  // verify dominance order
-  assert(verifyRegionList(LeftRegions, DT) &&
-         "Left regions are not in dominance order!");
-  assert(verifyRegionList(RightRegions, DT) &&
-         "Right regions are not in dominance order!");
+  // Sequence alignment requires a dominance chain on each side. General
+  // control flow can contain incomparable sibling regions; insertion order
+  // cannot turn that partial order into a valid chain. Reject this candidate
+  // rather than asserting or treating an empty list as a single-block path.
+  if (!verifyRegionList(LeftRegions, DT) ||
+      !verifyRegionList(RightRegions, DT)) {
+    INFO << "Skipping melding: path regions are not a dominance chain\n";
+    return false;
+  }
 
 #ifdef CFMELDER_DEBUG
   DEBUG << "Left regions : ";
@@ -483,6 +506,7 @@ void RegionAnalyzer::findMergeableRegions(BasicBlock &BB) {
   printRegionList(RightRegions, DT);
   errs() << "\n";
 #endif
+  return true;
 }
 
 unsigned RegionAnalyzer::regionMatchSize() const {

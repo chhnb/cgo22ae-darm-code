@@ -123,7 +123,7 @@ private:
   bool HasBbMatch = false;
   double BestBbMatchSimilarityScore = 0.0;
 
-  void findMergeableRegions(BasicBlock &BB);
+  bool findMergeableRegions(BasicBlock &BB);
   BasicBlock *findMostSimilarBb(BasicBlock *BB,
                                 SmallVectorImpl<BasicBlock *> &Candidates);
   // find mergeable BBs such that no additional divergence is introduced

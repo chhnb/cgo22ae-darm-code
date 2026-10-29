@@ -134,8 +134,9 @@ private:
 
 public:
   RegionMelder(RegionAnalyzer &MA) : MA(MA) {}
-  // meld I'th region pair
-  void merge(unsigned Index);
+  // Meld the I'th pair. Return false if replication has no valid region;
+  // rejection must not be reported as a CFG change by the pass driver.
+  bool merge(unsigned Index);
 
 };
 

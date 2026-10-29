@@ -2,6 +2,8 @@
 #include "CFMelderUtils.h"
 #include "RegionReplicator.h"
 #include "llvm/ADT/CachedHashString.h"
+#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/IR/Constants.h"
@@ -40,8 +42,13 @@ AlignedSeq<Value *> RegionMelder::getAlignmentOfBlocks(BasicBlock *LeftBb,
   // do sequence aligment
   SmallVector<Value *, 32> LSeq;
   SmallVector<Value *, 32> RSeq;
-  linearizeBb(LeftBb, LSeq);
-  linearizeBb(RightBb, RSeq);
+  // Block markers, PHIs and terminators are structural, not optional
+  // sequence-alignment matches. In particular, never clone two unmatched
+  // switch terminators into the same output block.
+  for (Instruction &I : *LeftBb)
+    if (!isa<PHINode>(I) && !I.isTerminator()) LSeq.push_back(&I);
+  for (Instruction &I : *RightBb)
+    if (!isa<PHINode>(I) && !I.isTerminator()) RSeq.push_back(&I);
   // AlignedSequence<Value *> AlignedSeq;
 
   // NeedlemanWunschSA<SmallVectorImpl<Value *>> SA(ScoringSystem(-1, 2),
@@ -51,19 +58,36 @@ AlignedSeq<Value *> RegionMelder::getAlignmentOfBlocks(BasicBlock *LeftBb,
   auto SMSA =
       SmithWaterman<Value *, SmallVectorImpl<Value *>, nullptr>(ScoringFunc);
 
-  auto Result = SMSA.compute(LSeq, RSeq);
-
+  AlignedSeq<Value *> Result;
+  Result.push_back(AlignedPair<Value *>(LeftBb, RightBb));
+  // PHIs are cloned separately at block creation, then fixed individually.
+  for (PHINode &PN : LeftBb->phis())
+    Result.push_back(AlignedPair<Value *>(&PN, nullptr));
+  for (PHINode &PN : RightBb->phis())
+    Result.push_back(AlignedPair<Value *>(nullptr, &PN));
+  Result.concat(SMSA.compute(LSeq, RSeq));
+  Result.push_back(AlignedPair<Value *>(LeftBb->getTerminator(),
+                                       RightBb->getTerminator()));
   return Result;
 }
 
 void RegionMelder::computeRegionSeqAlignment(
     DenseMap<BasicBlock *, BasicBlock *> BbMap) {
-  for (auto It = BbMap.begin(); It != BbMap.end(); It++) {
-    BasicBlock *LBB = It->first;
-    BasicBlock *RBB = It->second;
-
-    RegionInstrAlignement.concat(getAlignmentOfBlocks(LBB, RBB));
-  }
+  // Pointer-keyed DenseMap iteration depends on allocation addresses. Use CFG
+  // order so block cloning and deferred unpredication process defs before uses
+  // reproducibly. Keep unreachable matched blocks in stable function order.
+  SmallPtrSet<BasicBlock *, 32> Seen;
+  SmallVector<BasicBlock *, 32> Ordered;
+  for (BasicBlock *BB : ReversePostOrderTraversal<Function *>(MA.getParentFunction()))
+    if (BbMap.count(BB)) {
+      Ordered.push_back(BB);
+      Seen.insert(BB);
+    }
+  for (BasicBlock &BB : *MA.getParentFunction())
+    if (BbMap.count(&BB) && Seen.insert(&BB).second)
+      Ordered.push_back(&BB);
+  for (BasicBlock *LBB : Ordered)
+    RegionInstrAlignement.concat(getAlignmentOfBlocks(LBB, BbMap.lookup(LBB)));
   if (DumpSeqAlignStats) {
     InstrMeldingProfitabilityModel ScoringFunc;
     int SavedCycles = 0;
@@ -82,13 +106,16 @@ void RegionMelder::computeRegionSeqAlignment(
   }
 }
 
-bool requireUnpredication(BasicBlock* Current, BasicBlock* Corresponding) {
-  // if current contains store instructions we have to unpredicate
-  // for (auto& I : *Current) {
-  //   if(isa<StoreInst>(&I))
-  //     return true;
-  // }
-  return Corresponding->size() > 1;
+bool requireUnpredication(BasicBlock *Current, BasicBlock *Corresponding) {
+  if (Corresponding->size() > 1)
+    return true;
+  // An empty counterpart is not evidence that the current block is a
+  // replica. Unmatched stores/calls must retain their original path guard,
+  // and loads may trap on an address that is only valid on that path.
+  for (Instruction &I : *Current)
+    if (I.mayHaveSideEffects() || I.mayReadFromMemory())
+      return true;
+  return false;
 }
 
 void RegionMelder::cloneInstructions() {
@@ -165,13 +192,12 @@ void RegionMelder::cloneInstructions() {
         MergedInstructions.push_back(NewI);
 
         // update splitRanges
-        // unpredication is not done if one the blocks is just a branch, occurs
-        // in region replication
+        // Preserve path guards for effects and potentially trapping reads,
+        // including when the corresponding block contains only a branch.
         auto ClonedRightParentIt =
             MergedValuesToRightValues.find(NewI->getParent());
         assert(ClonedRightParentIt != MergedValuesToRightValues.end() &&
                "Cloned left BB not found for right value!");
-        // if (cast<BasicBlock>(ClonedRightParentIt->second)->size() > 1)
         if(requireUnpredication(LeftI->getParent(), cast<BasicBlock>(ClonedRightParentIt->second)))
           updateSplitRangeMap(true, NewI);
       }
@@ -185,13 +211,12 @@ void RegionMelder::cloneInstructions() {
         MergedInstructions.push_back(NewI);
 
         // update splitRanges
-        // unpredication is not done if one the blocks is just a branch, occurs
-        // in region replication
+        // Preserve path guards for effects and potentially trapping reads,
+        // including when the corresponding block contains only a branch.
         auto ClonedLeftParentIt =
             MergedValuesToLeftValues.find(NewI->getParent());
         assert(ClonedLeftParentIt != MergedValuesToLeftValues.end() &&
                "Cloned left BB not found for right value!");
-        // if (cast<BasicBlock>(ClonedLeftParentIt->second)->size() > 1)
         if(requireUnpredication(RightI->getParent(), cast<BasicBlock>(ClonedLeftParentIt->second)))
           updateSplitRangeMap(false, NewI);
       }
@@ -264,6 +289,19 @@ void RegionMelder::fixOperends() {
       if (isa<BranchInst>(L))
         setOperendsForBr(dyn_cast<BranchInst>(L), dyn_cast<BranchInst>(R),
                          dyn_cast<BranchInst>(MergedI));
+      else if (auto *LeftSwitch = dyn_cast<SwitchInst>(L)) {
+        auto *RightSwitch = cast<SwitchInst>(R);
+        auto *MergedSwitch = cast<SwitchInst>(MergedI);
+        Value *LC = LeftSwitch->getCondition();
+        Value *RC = RightSwitch->getCondition();
+        if (OrigToMergedValues.count(LC)) LC = OrigToMergedValues[LC];
+        if (OrigToMergedValues.count(RC)) RC = OrigToMergedValues[RC];
+        IRBuilder<> B(MergedSwitch);
+        MergedSwitch->setCondition(LC == RC ? LC :
+            B.CreateSelect(MA.getDivergentCondition(), LC, RC, "meld.switch"));
+        // Keep constant case values and CFG labels. Their left-side labels
+        // are remapped by runPostMergeCleanup; label-typed selects are invalid.
+      }
       else
         setOperends(LeftI, RightI, MergedI);
 
@@ -543,31 +581,61 @@ void RegionMelder::runPostMergeCleanup() {
 
 Region* RegionMelder::getRegionToReplicate(BasicBlock * MatchedBlock, BasicBlock* PathEntry) {
   BasicBlock* Curr = MatchedBlock;
-  Region* R = nullptr;
-  do {
+  SmallPtrSet<BasicBlock *, 32> Visited;
+  while (Curr && Visited.insert(Curr).second) {
     Region* Candidate = MA.getRI()->getRegionFor(Curr);
+    // The top-level region has no exit and cannot be replicated. In
+    // particular, its entry may have no predecessor: the old search would
+    // then retry the same Curr forever.
+    if (!Candidate || Candidate->isTopLevelRegion())
+      return nullptr;
     BasicBlock* Entry = Candidate->getEntry();
     if (MA.getPDT()->dominates(Entry, PathEntry)){
-      R = Candidate;
+      return Candidate;
     }
     else {
+      BasicBlock *Next = nullptr;
       for(auto* Pred : make_range(pred_begin(Entry), pred_end(Entry))) {
         if (!Candidate->contains(Pred)){
-          Curr = Pred;
+          Next = Pred;
           break;
         }
       }
+      Curr = Next;
     }
-
-  } while (!R);
-  assert(R != nullptr && "can not find region to replicate!"); 
-  return R;
+  }
+  return nullptr;
 }
 
 
-void RegionMelder::merge(unsigned Index) {
+bool RegionMelder::merge(unsigned Index) {
 
   bool RegionAlreadySimplified = false;
+  auto Entries = MA.getRegionMatchEntryBlocks(Index);
+  BasicBlock *Branch = MA.getDivergentBlock();
+  BasicBlock *LeftPath = Branch->getTerminator()->getSuccessor(0);
+  BasicBlock *RightPath = Branch->getTerminator()->getSuccessor(1);
+  if (Entries.first == Entries.second ||
+      !MA.getDT()->dominates(Branch, Entries.first) ||
+      !MA.getDT()->dominates(Branch, Entries.second) ||
+      !MA.getDT()->dominates(LeftPath, Entries.first) ||
+      !MA.getDT()->dominates(RightPath, Entries.second)) {
+    INFO << "Skipping melding: candidates are not local to their branch arms\n";
+    return false;
+  }
+
+  auto HasUnsafeControl = [](BasicBlock *BB) {
+    if (BB->hasAddressTaken() || BB->isEHPad()) return true;
+    for (Instruction &I : *BB)
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (CB->isConvergent()) return true;
+    return false;
+  };
+  for (auto &Pair : MA.getRegionMatch(Index))
+    if (HasUnsafeControl(Pair.first) || HasUnsafeControl(Pair.second)) {
+      INFO << "Skipping melding: escaping/EH/convergent control in region\n";
+      return false;
+    }
 
   if (MA.requireRegionReplication()) {
     INFO << "Replicating regions in BB-region match\n";
@@ -598,10 +666,41 @@ void RegionMelder::merge(unsigned Index) {
       RToReplicate = getRegionToReplicate(MatchedBlock, LeftPathEntry);
     }
 
+    // Reject before modifying the CFG if the region search cannot find a
+    // finite SESE region. The caller must continue with other candidates.
+    if (!RToReplicate) {
+      INFO << "Skipping melding: no valid region to replicate\n";
+      return false;
+    }
+    if (!ExpandedBlock->getUniqueSuccessor()) {
+      INFO << "Skipping melding: replicated block needs a unique successor\n";
+      return false;
+    }
+
+    // RegionReplicator builds binary branches and concretizes their conditions.
+    // In particular, a switch is not a BranchInst even when it has only two
+    // destinations. Reject unsupported CFGs before simplifyRegion mutates them.
+    // The exit is also cloned, unless simplification inserts a new branch-only
+    // exit in front of it.
+    bool NeedsSimplification = MA.requireRegionSimplification(RToReplicate);
+    bool HasUnsupportedTerminator = HasUnsafeControl(ExpandedBlock) ||
+        !isa<BranchInst>(ExpandedBlock->getTerminator());
+    for (BasicBlock *BB : RToReplicate->blocks())
+      HasUnsupportedTerminator |= HasUnsafeControl(BB) ||
+                                  !isa<BranchInst>(BB->getTerminator());
+    if (!NeedsSimplification)
+      HasUnsupportedTerminator |=
+          HasUnsafeControl(RToReplicate->getExit()) ||
+          !isa<BranchInst>(RToReplicate->getExit()->getTerminator());
+    if (HasUnsupportedTerminator) {
+      INFO << "Skipping melding: region replication requires branch terminators\n";
+      return false;
+    }
+
     // simplify the replicated region
     BasicBlock *ExitToReplicate = RToReplicate->getExit();
     BasicBlock *EntryToReplicate = RToReplicate->getEntry();
-    if (MA.requireRegionSimplification(RToReplicate)) {
+    if (NeedsSimplification) {
       INFO << "Replicated region is not a simple region, running region "
               "simplification\n";
       BasicBlock *Entry = RToReplicate->getEntry();
@@ -684,6 +783,34 @@ void RegionMelder::merge(unsigned Index) {
     ExitBlockR->printAsOperand(errs(), false);
     errs() << "\n";
   }
+  // Refuse unsupported structural pairs before mutating the CFG. Switches
+  // may be matched inside isomorphic regions, but cannot be used as exit
+  // dispatchers here; lower-switch is the supported entry/exit normalization.
+  for (auto &Pair : CurrMapping) {
+    for (BasicBlock *BB : {Pair.first, Pair.second}) {
+      if (BB->hasAddressTaken() || BB->isEHPad()) {
+        INFO << "Skipping melding: escaping block address or EH pad\n";
+        return false;
+      }
+      for (Instruction &I : *BB)
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (CB->isConvergent()) {
+            INFO << "Skipping melding: convergent call in candidate region\n";
+            return false;
+          }
+    }
+    Instruction *LT = Pair.first->getTerminator();
+    Instruction *RT = Pair.second->getTerminator();
+    if (!LT || !RT || LT->getOpcode() != RT->getOpcode() ||
+        (!isa<BranchInst>(LT) && !isa<SwitchInst>(LT) && !isa<ReturnInst>(LT)) ||
+        (isa<SwitchInst>(LT) &&
+         (!ExitBlockL || !ExitBlockR ||
+          Pair.first == ExitBlockL || Pair.second == ExitBlockR ||
+          !InstructionMatch::match(LT, RT)))) {
+      INFO << "Skipping melding: incompatible/unsupported terminator pair\n";
+      return false;
+    }
+  }
   // run pre merge passes
   runPreMergePasses(RegionAlreadySimplified);
 
@@ -729,6 +856,7 @@ void RegionMelder::merge(unsigned Index) {
   // verify the function
   // assert(!verifyFunction(*MA.getParentFunction()) &&
   //        "function verification failed!");
+  return true;
 }
 
 void RegionMelder::linearizeBb(BasicBlock *BB,
@@ -983,6 +1111,42 @@ void RegionMelder::mergeOutsideDefsAtEntry() {
   // recompute control-flow analyses
   MA.recomputeControlFlowAnalyses();
 
+  // Melding moves instructions from both paths below UnifyingBB. A value
+  // defined outside the matched blocks may dominate its original use without
+  // dominating this new entry. Carry such path-local live-ins through a PHI;
+  // the inactive path contributes undef, which is selected away or predicated
+  // off by the melding/unpredication machinery. Do not speculate their defs
+  // (in particular, loads) onto the other path.
+  DenseMap<Instruction *, PHINode *> PathLocalLiveIns;
+  auto IsMappedBlock = [&](BasicBlock *BB) {
+    for (auto &Pair : CurrMapping)
+      if (Pair.first == BB || Pair.second == BB)
+        return true;
+    return false;
+  };
+  auto MapPathLocalLiveIn = [&](Value *V) {
+    auto *Def = dyn_cast<Instruction>(V);
+    if (!Def || IsMappedBlock(Def->getParent()) ||
+        MA.getDT()->dominates(Def, UnifyingBB->getTerminator()))
+      return;
+    PHINode *&LiveIn = PathLocalLiveIns[Def];
+    if (!LiveIn) {
+      LiveIn = PHINode::Create(Def->getType(),
+                               LeftEntryPreds.size() + RightEntryPreds.size(),
+                               "unify.livein", &*UnifyingBB->begin());
+      for (BasicBlock *Pred : predecessors(UnifyingBB))
+        LiveIn->addIncoming(MA.getDT()->dominates(Def, Pred->getTerminator())
+                                ? static_cast<Value *>(Def)
+                                : UndefValue::get(Def->getType()), Pred);
+    }
+    OrigToMergedValues[Def] = LiveIn;
+  };
+  for (BasicBlock &BB : *MA.getParentFunction())
+    if (IsMappedBlock(&BB))
+      for (Instruction &I : BB)
+        for (Use &Op : I.operands())
+          MapPathLocalLiveIn(Op.get());
+
   // check if there are any def-use chains that are broken
   for (auto &BB : *MA.getParentFunction()) {
     // only need to check basic blocks detween top entry and unify BB
@@ -1110,6 +1274,16 @@ void RegionMelder::runPostOptimizations() {
           for (unsigned J = I + 1; J < Phi.getNumIncomingValues(); J++) {
             if (Phi.getIncomingBlock(I) == Phi.getIncomingBlock(J) &&
                 Phi.getIncomingValue(I) == Phi.getIncomingValue(J)) {
+              // A switch can have several real edges to the same block.
+              // Remove only excess entries introduced by CFG coalescing,
+              // not the edge multiplicity required by a valid PHI.
+              BasicBlock *Pred = Phi.getIncomingBlock(I);
+              unsigned Edges = 0, Incoming = 0;
+              for (BasicBlock *P : predecessors(Phi.getParent()))
+                if (P == Pred) ++Edges;
+              for (unsigned K = 0; K < Phi.getNumIncomingValues(); ++K)
+                if (Phi.getIncomingBlock(K) == Pred) ++Incoming;
+              if (Incoming <= Edges) continue;
               Phi.removeIncomingValue(J);
               Changed = true;
               break;
@@ -1145,8 +1319,10 @@ void RegionMelder::runPostOptimizations() {
           BI->getSuccessor(0) == BI->getSuccessor(1)) {
         DEBUG << "Converting conditional branch to unconditional\n";
         IRBuilder<> Builder(BI);
-        // BasicBlock *singleDest = BI->getSuccessor(0);
-        // singleDest->removePredecessor(BI->getParent());
+        // Replacing two edges with one must also remove one PHI incoming
+        // edge; it is not safe to rely on the duplicate-PHI cleanup above.
+        BasicBlock *SingleDest = BI->getSuccessor(0);
+        SingleDest->removePredecessor(BI->getParent());
         Builder.CreateBr(BI->getSuccessor(0));
         BI->eraseFromParent();
       }

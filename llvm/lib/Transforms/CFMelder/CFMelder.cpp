@@ -14,6 +14,7 @@
 #include "CFMelderUtils.h"
 #include "RegionMelder.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/DivergenceAnalysis.h"
 #include "llvm/Analysis/DominanceFrontier.h"
@@ -43,6 +44,10 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "cfmelder"
+
+static cl::opt<bool> AdjacentEntryOnly(
+    "cfmelder-entry-only", cl::init(false), cl::Hidden,
+    cl::desc("Only meld across the function entry branch; external adjacent scheduler"));
 
 static cl::opt<bool>
     ForceMerging("force-cf-merging", cl::init(false), cl::Hidden,
@@ -185,6 +190,21 @@ static bool runImpl(Function &F, DominatorTree &DT, PostDominatorTree &PDT,
 
     for (auto &BB : F) {
       // check if this BB is the enrty to a diamond shaped control-flow
+      if (AdjacentEntryOnly) {
+        // LowerSwitch leaves an unconditional entry trampoline. Follow only
+        // single-predecessor unconditional chains to the first real branch;
+        // do not wander into loop headers or arbitrary nested regions.
+        BasicBlock *Entry = &F.getEntryBlock();
+        SmallPtrSet<BasicBlock *, 8> Seen;
+        while (Seen.insert(Entry).second) {
+          auto *BI = dyn_cast_or_null<BranchInst>(Entry->getTerminator());
+          if (!BI || BI->isConditional()) break;
+          BasicBlock *Next = BI->getSuccessor(0);
+          if (Next->getUniquePredecessor() != Entry) break;
+          Entry = Next;
+        }
+        if (&BB != Entry) continue;
+      }
       if (Utils::isValidMergeLocation(BB, PDT)) {
         INFO << "Valid merge location found at BB ";
         BB.printAsOperand(errs(), false);
@@ -200,10 +220,16 @@ static bool runImpl(Function &F, DominatorTree &DT, PostDominatorTree &PDT,
             if (!MA.isRegionMatchProfitable(I))
               continue;
             RegionMelder RM(MA);
-            RM.merge(I);
+            if (!RM.merge(I))
+              continue;
+            if (AdjacentEntryOnly)
+              errs() << "ADJACENT_ENTRY_MELD_SUCCESS\n";
             LocalChange = true;
             MA.recomputeControlFlowAnalyses();
-            
+            // A successful merge can erase blocks or make the divergent
+            // branch unconditional. The remaining matches refer to the old
+            // CFG; restart discovery instead of consuming stale candidates.
+            break;
           }
           if (LocalChange) {
             if(!NoSimplifyCFGAfterMelding){
@@ -218,12 +244,12 @@ static bool runImpl(Function &F, DominatorTree &DT, PostDominatorTree &PDT,
         }
       }
     }
+    Changed |= LocalChange;
+
     // if one melding is requested, exit (debugging)
     if(RunMeldingOnce) {
       break;
     }
-
-    Changed |= LocalChange;
 
   } while (LocalChange);
 

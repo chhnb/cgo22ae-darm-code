@@ -253,14 +253,15 @@ bool matchSwitchInsts(const SwitchInst *SI1, const SwitchInst *SI2) {
   if (SI1->getNumCases() == SI2->getNumCases()) {
     auto CaseIt1 = SI1->case_begin(), CaseEnd1 = SI1->case_end();
     auto CaseIt2 = SI2->case_begin(), CaseEnd2 = SI2->case_end();
-    do {
-      auto *Case1 = &*CaseIt1;
-      auto *Case2 = &*CaseIt2;
-      if (Case1 != Case2)
+    while (CaseIt1 != CaseEnd1 && CaseIt2 != CaseEnd2) {
+      // Case handles belong to different instructions; compare labels, not
+      // addresses of iterator-proxy objects. Destinations are checked by the
+      // region mapping and remapped during CFG reconstruction.
+      if (CaseIt1->getCaseValue() != CaseIt2->getCaseValue())
         return false; // TODO: could allow permutation!
       ++CaseIt1;
       ++CaseIt2;
-    } while (CaseIt1 != CaseEnd1 && CaseIt2 != CaseEnd2);
+    }
     return true;
   }
   return false;

@@ -54,6 +54,13 @@ private:
       auto SolnRight =
           constructSoln(M, Seq1, Seq2, Maxi + 1, EndRow, Maxj + 1, EndCol);
       Soln.concat(SolnRight);
+    } else {
+      // A local optimum may exhaust only one sequence. The other suffix
+      // still contains real program instructions and must not disappear.
+      for (int I = Maxi + 1; I <= EndRow; ++I)
+        Soln.push_back(AlignedPair<elemTy>(Seq1[I], none_value));
+      for (int J = Maxj + 1; J <= EndCol; ++J)
+        Soln.push_back(AlignedPair<elemTy>(none_value, Seq2[J]));
     }
 
     // add any remainder from the begining of the Matrix
